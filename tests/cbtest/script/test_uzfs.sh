@@ -23,7 +23,7 @@ fi
 ZPOOL="$SRC_PATH/cmd/zpool/zpool"
 ZFS="$SRC_PATH/cmd/zfs/zfs"
 ZDB="$SRC_PATH/cmd/zdb/zdb"
-TGT="$SRC_PATH/cmd/zrepl/zrepl"
+TGT="$SRC_PATH/cmd/zrepl/zrepl start -t 127.0.0.1"
 TGT_IP="127.0.0.1"
 GTEST="$SRC_PATH/tests/cbtest/gtest/test_uzfs"
 ZTEST="$SRC_PATH/cmd/ztest/ztest"

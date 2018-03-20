@@ -115,9 +115,11 @@ protected:
 		std::string zrepl_path = getCmdPath("zrepl");
 
 		m_pid = fork();
-		if (m_pid == 0)
+		if (m_pid == 0) {
 			execl(zrepl_path.c_str(), zrepl_path.c_str(),
-			    "127.0.0.1", NULL);
+				"start", "-t", "127.0.0.1", NULL);
+		}
+
 	}
 
 	virtual void TearDown() override {
