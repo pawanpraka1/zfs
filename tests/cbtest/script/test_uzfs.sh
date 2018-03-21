@@ -104,7 +104,10 @@ init_test()
 #
 close_test()
 {
-	kill -SIGKILL $TGT_PID
+	if [ $TGT_PID -ne -1 ]; then
+		kill -SIGKILL $TGT_PID
+	fi
+
 	rm "$TMPDIR/test_disk1.img"
 	rm "$TMPDIR/test_disk2.img"
 	rm "$TMPDIR/test_disk3.img"
@@ -564,6 +567,9 @@ test_raidz_pool()
 
 test_fio()
 {
+	init_test
+	sleep 10
+
 	log_must $ZPOOL create -f $SRCPOOL \
 	    -o cachefile="$TMPDIR/zpool_$SRCPOOL.cache" \
 	    "$TMPDIR/test_disk1.img"
@@ -606,6 +612,8 @@ EOF
 	log_must $ZFS destroy -r $SRCPOOL/vol2
 	log_must destroy_pool $SRCPOOL
 	log_must rm $TMPDIR/test.fio
+
+	close_test
 
 	return 0
 }
@@ -714,7 +722,7 @@ run_uzfs_test()
 	log_must $UZFS_TEST -t 10 -a  $(( 1000 * 1024 * 1024 )) -T 3 -n 10000
 	log_must $UZFS_TEST -t 10 -T 4
 
-	log_must $UZFS_TEST -t 10 -T 0
+	log_must $UZFS_TEST -t 10 -T 0 -n 10
 
 #	log_must . $UZFS_TEST_SYNC_SH
 
@@ -739,27 +747,99 @@ run_dmu_test()
 	return 0
 }
 
-init_test
-sleep 10
+usage()
+{
+cat << EOF
+usage:
+$0 [h] [-T test_type]
 
-log_must test_stripe_pool
-log_must test_mirror_pool
-log_must test_raidz_pool
-if [ -n "$FIO_SRCDIR" ]; then
-	log_must test_fio
-else
-	echo "Skipping FIO tests - FIO_SRCDIR not defined"
+test_type :
+	- pool_test (verify pool create/destroy functionality)
+	- zvol_test (zvol sync test, read/write and replay tests)
+	- rebuild_test (zvol rebuild related tests)
+	- txg_diff_test (txg diff API test)
+	- fio_test
+EOF
+}
+
+while getopts 'hT:' OPTION; do
+	case $OPTION in
+	h)
+		usage
+		exit 1
+		;;
+	T)
+		test_type="$OPTARG"
+		;;
+	?)
+		usage
+		exit
+		;;
+	esac
+done
+
+shift $((OPTIND-1))
+
+if [ -z $test_type ]; then
+	usage
+	exit
 fi
 
-close_test
+run_fio_test()
+{
+	log_must test_fio
+}
 
-log_must run_uzfs_test
+run_pool_test()
+{
+	init_test
+	sleep 10
 
-log_must run_dmu_test
+	log_must test_stripe_pool
+	log_must test_mirror_pool
+	log_must test_raidz_pool
 
-log_must $GTEST
-log_must $ZTEST
+	close_test
+}
 
-echo "##################################"
-echo "All test cases passed"
-echo "##################################"
+run_zvol_test()
+{
+	log_must run_uzfs_test
+	log_must run_dmu_test
+	log_must $GTEST
+	log_must $ZTEST
+}
+
+run_rebuild_test()
+{
+	log_must $UZFS_TEST -T 5 -t 60 -n 3
+	log_must $UZFS_TEST -T 5 -t 120 -n 3
+
+}
+
+run_txg_diff_test()
+{
+	K=1024
+	M=$(( 1024 * 1024 ))
+	G=$(( 1024 * 1024 * 1024 ))
+
+	log_must $UZFS_TEST -a  $(( 100 * $M )) -T 3 -n 10000
+	log_must $UZFS_TEST -a  $(( 1 * $G)) -T 3 -n 10000
+
+	log_must $UZFS_TEST -T 4
+}
+
+test_func="run_${test_type}"
+type -t $test_func
+if [ $? -eq 0 ]; then
+	START=$(date +%s.%N)
+	$test_func
+	END=$(date +%s.%N)
+	DIFF=$(echo "scale=0;$END - $START" | bc)
+	echo -e "\n####################################"
+	echo "All cases passed for $test_type in ${DIFF%.*} seconds"
+	echo "####################################"
+else
+	usage
+	exit 1
+fi

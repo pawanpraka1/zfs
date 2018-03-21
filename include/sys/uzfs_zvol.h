@@ -48,6 +48,33 @@ typedef struct metaobj_blk_offset {
 } metaobj_blk_offset_t;
 
 /*
+ * rebuild related information for zvol
+ */
+typedef struct zvol_rebuild_data {
+	/* mutex to synchronize io tree operation */
+	kmutex_t io_tree_mtx;
+	uint64_t rebuild_bytes;
+	avl_tree_t *incoming_io_tree;   /* incoming io tree */
+} zvol_rebuild_data_t;
+
+/*
+ * zvol rebuild related state
+ */
+typedef enum zvol_rebuild_status {
+	ZVOL_REBUILDING_INIT,		/* rebuilding initiated on zvol */
+	ZVOL_REBUILDING_IN_PROGRESS,	/* zvol is rebuilding */
+	ZVOL_REBUILDING_DONE		/* done with rebuilding */
+} zvol_rebuild_status_t;
+
+/*
+ * zvol status
+ */
+typedef enum zvol_status {
+	ZVOL_STATUS_HEALTHY,		/* zvol has latest data */
+	ZVOL_STATUS_DEGRADED		/* zvol is missing some data */
+} zvol_status_t;
+
+/*
  * The in-core state of each volume.
  */
 struct zvol_state {
@@ -68,6 +95,9 @@ struct zvol_state {
 	 * This should not be greater than volblocksize
 	 */
 	uint64_t zv_metavolblocksize;
+	zvol_rebuild_status_t zv_rebuild_status; /* zvol rebuilding status */
+	zvol_status_t zv_status;	/* zvol status */
+	zvol_rebuild_data_t rebuild_data;
 };
 
 typedef struct zvol_state zvol_state_t;
@@ -107,6 +137,17 @@ typedef struct uzfs_zvol_blk_phy {
 	uint64_t len;
 	avl_node_t uzb_link;
 } uzfs_zvol_blk_phy_t;
+
+/*
+ * structure to hold information of non-overlapping
+ * rebuild IO
+ */
+typedef struct uzfs_io_chunk_list {
+	uint64_t offset;
+	uint64_t len;
+	char *buf;
+	list_node_t link;
+} uzfs_io_chunk_list_t;
 
 typedef int (uzfs_txg_diff_traverse_cb_t)(off_t offset, size_t len,
     uint64_t blkid, void *arg);

@@ -24,8 +24,10 @@
 #include <sys/uzfs_zvol.h>
 #include <sys/stat.h>
 #include <uzfs.h>
+#include <uzfs_mtree.h>
 #include <zrepl_mgmt.h>
 #include <uzfs_mgmt.h>
+#include <uzfs_io.h>
 
 static int uzfs_fd_rand = -1;
 
@@ -288,6 +290,8 @@ uzfs_open_dataset_init(const char *ds_name, zvol_state_t **z)
 	zv->zv_spa = spa;
 	zfs_rlock_init(&zv->zv_range_lock);
 	zfs_rlock_init(&zv->zv_mrange_lock);
+	mutex_init(&zv->rebuild_data.io_tree_mtx, NULL, MUTEX_DEFAULT, NULL);
+	uzfs_create_txg_diff_tree((void **)&zv->rebuild_data.incoming_io_tree);
 
 	strlcpy(zv->zv_name, ds_name, MAXNAMELEN);
 
@@ -339,6 +343,9 @@ free_ret:
 	zv->zv_zilog = zil_open(os, zvol_get_data);
 	zv->zv_volblocksize = block_size;
 	zv->zv_volsize = vol_size;
+
+	/* On boot, mark zvol status health */
+	uzfs_zvol_set_status(zv, ZVOL_STATUS_DEGRADED);
 
 	if (spa_writeable(dmu_objset_spa(os))) {
 //		if (zil_replay_disable)
@@ -447,6 +454,8 @@ uzfs_close_dataset(zvol_state_t *zv)
 	zil_close(zv->zv_zilog);
 	dnode_rele(zv->zv_dn, zv);
 	dmu_objset_disown(zv->zv_objset, zv);
+	mutex_destroy(&zv->rebuild_data.io_tree_mtx);
+	uzfs_destroy_txg_diff_tree(zv->rebuild_data.incoming_io_tree);
 	zfs_rlock_destroy(&zv->zv_range_lock);
 	zfs_rlock_destroy(&zv->zv_mrange_lock);
 	spa_close(zv->zv_spa, zv);
