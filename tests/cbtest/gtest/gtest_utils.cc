@@ -2,6 +2,11 @@
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <cstdio>
 #include <iostream>
@@ -59,17 +64,13 @@ std::string GtestUtils::getCmdPath(std::string zfsCmd) {
  * Executes given zfs command with specified arguments and returns its output
  * or throws exception if anything (including the command itself) fails).
  */
-std::string GtestUtils::execCmd(std::string const &zfsCmd,
-				std::string const &args) {
-	std::string cmdLine;
+std::string GtestUtils::execStr(std::string const &str) {
 	std::array<char, 128> buffer;
 	std::string result;
 	FILE *pipe;
 	int rc;
 
-	cmdLine = getCmdPath(zfsCmd) + " " + args;
-
-	pipe = popen(cmdLine.c_str(), "r");
+	pipe = popen(str.c_str(), "r");
 	if (!pipe)
 		throw std::runtime_error("popen() failed");
 	while (!feof(pipe)) {
@@ -78,14 +79,25 @@ std::string GtestUtils::execCmd(std::string const &zfsCmd,
 	}
 	rc = pclose(pipe);
 	if (rc != 0)
-		throw std::runtime_error(std::string("Command failed: ") +
-		    cmdLine);
+		throw std::runtime_error(std::string("Command failed: ") + str);
 
 	// Trim white space at the end of string
 	result.erase(std::find_if(result.rbegin(), result.rend(),
 	    std::not1(std::ptr_fun<int, int>(std::isspace))).base(),
 	    result.end());
 	return result;
+}
+
+/*
+ * Executes given zfs command with specified arguments and returns its output
+ * or throws exception if anything (including the command itself) fails).
+ */
+std::string GtestUtils::execCmd(std::string const &zfsCmd,
+				std::string const &args) {
+	std::string cmdLine;
+
+	cmdLine = getCmdPath(zfsCmd) + " " + args;
+	return GtestUtils::execStr(cmdLine);
 }
 
 void GtestUtils::Vdev::create() {
@@ -191,6 +203,13 @@ GtestUtils::strlcpy(char *dst, const char *src, size_t len)
         (void) memcpy(dst, src, copied);
         dst[copied] = '\0';
         return (slen);
+}
+
+GtestUtils::SocketFd::SocketFd() {
+	m_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (m_fd < 0) {
+		throw std::runtime_error("Failed to create socket");
+	}
 }
 
 int

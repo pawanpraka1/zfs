@@ -134,13 +134,14 @@ Make sure to run cstyle on your changes before you submit a pull request:
 make cstyle
 ```
 
-And assure that the tests are passing. For possible tests to run see .travis.yml
-file in root directory. Here is an example of running a couple of available
-tests:
+And assure that the tests are passing. For some of the unit tests you will need
+to enable special test code by `--enable-mock` configure option.
+Here is an example of running a couple of available tests:
 
 ```bash
 cmd/ztest/ztest -V
-tests/cbtest/gtest/test_uzfs
-tests/cbtest/gtest/test_zrepl_prot
+sudo tests/cbtest/gtest/test_uzfs
+sudo tests/cbtest/gtest/test_zrepl_prot
+sudo tests/cbtest/gtest/test_vdev
 sudo tests/cbtest/script/test_uzfs.sh
 ```

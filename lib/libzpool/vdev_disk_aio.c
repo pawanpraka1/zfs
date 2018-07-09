@@ -51,7 +51,7 @@ extern const uint32_t zfs_vdev_max_active;
  * By default it is set to one which means we don't try to group IOs,
  * which gives better result for synchronous workloads and faster CPUs.
  */
-#define	AIO_QUEUE_HIGH_WM	1
+volatile int aio_queue_high_wm = 1;
 
 /*
  * poll sleep interval makes difference only if high wm above is greater
@@ -61,11 +61,35 @@ extern const uint32_t zfs_vdev_max_active;
  * NOTE: Empirically was found that 100us works well in absence of events
  * (a kind of semi-busy-poll).
  */
-#define	POLL_SLEEP	100000000
+volatile int poll_sleep	= 100000000;
 
 /* SCSI flush command timeout in milliseconds */
 #define	SCSI_FLUSH_TIMEOUT	1000
 #define	SCSI_SENSE_BUF_LEN	32
+
+/*
+ * Mock certain functions from libzpool in order to be able to intercept
+ * those calls in a test suite.
+ */
+#ifdef MOCK_ENABLE
+
+void
+__attribute__((weak))
+mocked_zio_interrupt(zio_t *zio)
+{
+	return (zio_interrupt(zio));
+}
+
+void
+__attribute__((weak))
+mocked_zio_execute(zio_t *zio)
+{
+	return (zio_execute(zio));
+}
+
+#define	zio_interrupt	mocked_zio_interrupt
+#define	zio_execute	mocked_zio_execute
+#endif
 
 /*
  * Virtual device vector for disks accessed from userland using linux aio(7) API
@@ -221,7 +245,7 @@ vdev_disk_aio_poller(void *arg)
 
 	while (!vda->vda_stop_polling) {
 		timeout.tv_sec = 0;
-		timeout.tv_nsec = POLL_SLEEP;
+		timeout.tv_nsec = poll_sleep;
 		nr = 0;
 
 		/* First we try non-blocking userspace poll which is fast */
@@ -358,9 +382,9 @@ vdev_disk_aio_submitter(void *arg)
 	iocbs = kmem_alloc(zfs_vdev_max_active * sizeof (struct iocb *),
 	    KM_SLEEP);
 
-	if (AIO_QUEUE_HIGH_WM > 1) {
+	if (aio_queue_high_wm > 1) {
 		ts.tv_sec = 0;
-		ts.tv_nsec = POLL_SLEEP;
+		ts.tv_nsec = poll_sleep;
 	} else {
 		ts.tv_sec = 1;
 		ts.tv_nsec =  0;
@@ -384,10 +408,10 @@ vdev_disk_aio_submitter(void *arg)
 
 		/*
 		 * Dequeue all ZIOs from ring buffer even if there was no event
-		 * (and if high-wm > 1), because we want to guarantee that every
+		 * (or if high-wm > 1), because we want to guarantee that every
 		 * IO request is dispatched within reasonable time frame.
 		 */
-		if (event_came || AIO_QUEUE_HIGH_WM > 1) {
+		if (event_came || aio_queue_high_wm > 1) {
 			/*
 			 * Using single consumer since there is only one
 			 * submitter thread dequeuing from the ring buffer.
@@ -685,7 +709,7 @@ vdev_disk_aio_start(zio_t *zio)
 		 * and is waiting for data to be written to disk to continue.
 		 * So submit IOs which have been queued in input ring buffer.
 		 */
-		if (AIO_QUEUE_HIGH_WM > 1)
+		if (aio_queue_high_wm > 1)
 			kick_submitter(vda);
 
 		/*
@@ -718,7 +742,7 @@ vdev_disk_aio_start(zio_t *zio)
 		zio->io_error = (SET_ERROR(EBUSY));
 		zio_interrupt(zio);
 	}
-	if (rte_ring_count(vda->vda_ring) >= AIO_QUEUE_HIGH_WM) {
+	if (rte_ring_count(vda->vda_ring) >= aio_queue_high_wm) {
 		kick_submitter(vda);
 	}
 }

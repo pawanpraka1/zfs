@@ -3,11 +3,6 @@
 #define	_UZFS_UTILS_H
 
 #include <gtest/gtest.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <netinet/tcp.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 /* Prints errno string if cond is not true */
 #define	ASSERT_ERRNO(fname, cond)	do { \
@@ -19,6 +14,7 @@
 
 namespace GtestUtils {
 
+std::string execStr(std::string const &str);
 std::string execCmd(std::string const &zfsCmd, std::string const &args);
 std::string getCmdPath(std::string zfsCmd);
 int verify_buf(void *buf, int len, const char *pattern);
@@ -110,12 +106,7 @@ public:
  */
 class SocketFd {
 public:
-	SocketFd() {
-		m_fd = socket(AF_INET, SOCK_STREAM, 0);
-		if (m_fd < 0) {
-			throw std::runtime_error("Failed to create socket");
-		}
-	}
+	SocketFd();
 	~SocketFd() {
 		if (m_fd >= 0) {
 			close(m_fd);

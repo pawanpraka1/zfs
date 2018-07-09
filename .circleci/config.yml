@@ -48,7 +48,7 @@ jobs:
             make -j4;
             cd ../zfs
             sh autogen.sh
-            ./configure --with-config=user --enable-code-coverage=yes --enable-debug --enable-uzfs=yes --with-jemalloc --with-fio=$PWD/../fio
+            ./configure --with-config=user --enable-code-coverage=yes --enable-debug --enable-uzfs=yes --enable-mock --with-jemalloc --with-fio=$PWD/../fio
             make -j4;
             make cstyle;
             sudo sh -c 'echo "/tmp/core.%e.%p.%h.%t" > /proc/sys/kernel/core_pattern';

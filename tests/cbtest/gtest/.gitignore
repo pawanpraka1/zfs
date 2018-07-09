@@ -2,3 +2,4 @@
 /test_uzfsserver
 /test_zrepl_prot
 /test_zfs
+/test_vdev
