@@ -60,6 +60,10 @@ uzfs_zvol_create_snaprebuild_clone(zvol_state_t *zv,
 int
 uzfs_zvol_destroy_snaprebuild_clone(zvol_state_t *zv,
     zvol_state_t *snap_zv);
+int
+uzfs_zvol_create_internal_snapshot(zvol_state_t *zv, zvol_state_t **snap_zv,
+    uint64_t io_num, char **snap);
+
 #ifdef __cplusplus
 }
 #endif

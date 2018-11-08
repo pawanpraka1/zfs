@@ -208,29 +208,6 @@ done:
 }
 
 static void
-check_snapshot(zvol_state_t *zv, blk_metadata_t *md, boolean_t err)
-{
-	objset_t *s_obj;
-	char *dataset;
-	int ret = 0;
-
-	dataset = kmem_asprintf("%s@%s%lu", zv->zv_name,
-	    IO_DIFF_SNAPNAME, md->io_num);
-
-	ret = dmu_objset_own(dataset, DMU_OST_ANY, B_TRUE, zv, &s_obj);
-	if ((ret != 0 && err) ||
-	    (!err && ret == 0)) {
-		printf("ret:%d\n", ret);
-		printf("snapshot %s %s\n", dataset,
-		    (err) ? "should not be removed" : "should be removed");
-		exit(1);
-	}
-
-	if (ret == 0)
-		dmu_objset_disown(s_obj, zv);
-}
-
-static void
 fetch_modified_data(void *arg)
 {
 	struct rebuilding_data *repl_data = arg;
@@ -258,9 +235,7 @@ fetch_modified_data(void *arg)
 			break;
 
 		offset += len;
-		if (offset != r_data->zvol->zv_volsize)
-			check_snapshot(repl_data->zvol, &md, B_TRUE);
-		else
+		if (offset == r_data->zvol->zv_volsize)
 			break;
 	}
 
@@ -268,8 +243,6 @@ fetch_modified_data(void *arg)
 		printf("error(%d)... while fetching modified data\n", err);
 		exit(1);
 	}
-
-	check_snapshot(repl_data->zvol, &md, B_FALSE);
 
 	printf("finished fetching modified data\n");
 
