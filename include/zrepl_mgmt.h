@@ -108,6 +108,7 @@ typedef struct zvol_info_s {
 	zvol_state_t	*snapshot_zv; // snap volume from where clone is created
 	zvol_state_t    *rebuild_zv; // current snapshot which is rebuilding
 	uint64_t	refcnt;
+	uint64_t	is_io_receiver_created;
 
 	/*
 	 * While checking for these big flags, do as below,
@@ -117,7 +118,6 @@ typedef struct zvol_info_s {
 	union {
 		struct {
 			int	is_io_ack_sender_created	: 1;
-			int	is_io_receiver_created		: 1;
 		};
 		int flags;
 	};
@@ -212,7 +212,6 @@ typedef struct zvol_info_s {
 typedef struct thread_args_s {
 	char zvol_name[MAXNAMELEN];
 	zvol_info_t *zinfo;
-	int fd;
 } thread_args_t;
 
 extern void (*zinfo_create_hook)(zvol_info_t *, nvlist_t *);
@@ -223,15 +222,25 @@ typedef struct zinfo_fd_s {
 	int fd;
 } zinfo_fd_t;
 
+typedef struct zvol_conn {
+	STAILQ_HEAD(, zvol_io_cmd_s)	io_ackq;
+	int fd;
+	int len;
+	int evfd;
+	pthread_mutex_t conn_mutex;
+} zvol_conn_t;
+
 typedef struct zvol_io_cmd_s {
 	STAILQ_ENTRY(zvol_io_cmd_s) cmd_link;
 	zvol_io_hdr_t 	hdr;
 	zvol_info_t	*zinfo;
+	zvol_conn_t	*mconn;
 	void		*buf;
 	uint64_t	buf_len;
 	uint64_t 	io_start_time;
 	metadata_desc_t	*metadata_desc;
 	int		conn;
+	uint64_t	plen;
 } zvol_io_cmd_t;
 
 typedef struct zvol_rebuild_s {
@@ -255,6 +264,7 @@ extern int create_and_bind(const char *port, int bind_needed,
     boolean_t nonblocking);
 int uzfs_zvol_name_compare(zvol_info_t *zv, const char *name);
 void shutdown_fds_related_to_zinfo(zvol_info_t *zinfo);
+extern int uzfs_mconn_io_ack_sender(zvol_info_t *zinfo, zvol_conn_t *conn);
 
 extern void uzfs_zinfo_set_status(zvol_info_t *zinfo, zvol_status_t status);
 extern zvol_status_t uzfs_zinfo_get_status(zvol_info_t *zinfo);

@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/eventfd.h>
 
 #include <sys/dsl_destroy.h>
 #include <sys/dsl_dir.h>
@@ -167,6 +168,72 @@ uzfs_zvol_socket_read(int fd, char *buf, uint64_t nbytes)
 }
 
 /*
+ * This API is to read data from "blocking" sockets
+ * Returns 0 on success, -1 on error
+ */
+int
+uzfs_zvol_conn_read(int fd, char *buf, uint64_t nbytes)
+{
+	ssize_t count = 0;
+	char *p = buf;
+	while (nbytes) {
+		count = read(fd, (void *)p, nbytes);
+		if (count < 0) {
+			if (errno == EAGAIN)
+				break;
+			LOG_ERRNO("Socket(%d) read error", fd);
+			return (-1);
+		} else if (count == 0) {
+			LOG_INFO("Connection closed by the peer for socket(%d)",
+			    fd);
+			return (-1);
+		}
+		p += count;
+		nbytes -= count;
+	}
+	return (p - buf);
+}
+
+/*
+ * Read header message from socket in safe manner, which is: first we read a
+ * version number and if valid then we read the rest of the message.
+ *
+ * Return value < 0 => error
+ *              > 0 => invalid version
+ *              = 0 => ok
+ */
+int
+uzfs_zvol_read_conn_header(int fd, zvol_io_hdr_t *hdr, int *len)
+{
+	int rc;
+
+	if (*len < sizeof (hdr->version)) {
+		rc = uzfs_zvol_conn_read(fd, (char *)hdr + *len,
+		    sizeof (hdr->version) - *len);
+		if (rc < 0)
+			return (-1);
+		*len += rc;
+		if (*len != sizeof (hdr->version))
+			return (0);
+	}
+
+	if (*len < sizeof (*hdr)) {
+		if (hdr->version != REPLICA_VERSION) {
+			LOG_ERR("invalid replica protocol version %d",
+			    hdr->version);
+			return (1);
+		}
+		rc = uzfs_zvol_conn_read(fd,
+		    ((char *)hdr) + *len,
+		    sizeof (*hdr) - *len);
+		if (rc < 0)
+			return (-1);
+		*len += rc;
+	}
+	return (*len >= sizeof (*hdr));
+}
+
+/*
  * Read header message from socket in safe manner, which is: first we read a
  * version number and if valid then we read the rest of the message.
  *
@@ -219,6 +286,54 @@ uzfs_zvol_socket_write(int fd, char *buf, uint64_t nbytes)
 		nbytes -= count;
 	}
 	return (0);
+}
+
+int
+uzfs_zvol_conn_write(int fd, char *buf, uint64_t nbytes)
+{
+	ssize_t count = 0;
+	char *p = buf;
+	while (nbytes) {
+		count = write(fd, (void *)p, nbytes);
+		if (count < 0) {
+			if (errno == EAGAIN)
+				break;
+			LOG_ERRNO("Socket write error");
+			return (-1);
+		}
+		p += count;
+		nbytes -= count;
+	}
+	return (p - buf);
+}
+
+static int
+uzfs_ack_write(zvol_io_cmd_t *zio_cmd)
+{
+	ssize_t count = 0, sent = 0;
+	int fd = zio_cmd->conn;
+
+	if (zio_cmd->plen >= sizeof (zio_cmd->hdr))
+		return (0);
+
+	char *data = (char *)&zio_cmd->hdr + zio_cmd->plen;
+	uint64_t nbytes = sizeof (zio_cmd->hdr) - zio_cmd->plen;
+
+	while (nbytes) {
+		count = write(fd, (void *)data, nbytes);
+		if (count < 0) {
+			if (errno == EAGAIN) {
+				LOG_ERRNO("Socket ack write error");
+				break;
+			}
+			return (-1);
+		}
+		sent += count;
+		data += count;
+		nbytes -= count;
+	}
+	zio_cmd->plen += sent;
+	return (!!nbytes);
 }
 
 /*
@@ -323,6 +438,8 @@ uzfs_zvol_worker(void *arg)
 	rebuild_cmd_req = hdr->flags & ZVOL_OP_FLAG_REBUILD;
 	read_metadata = hdr->flags & ZVOL_OP_FLAG_READ_METADATA;
 
+	atomic_inc_64(&zinfo->inflight_io_cnt);
+
 	if (!zinfo->is_io_ack_sender_created) {
 		if (!(rebuild_cmd_req && (hdr->opcode == ZVOL_OPCODE_WRITE)))
 			zio_cmd_free(&zio_cmd);
@@ -341,8 +458,6 @@ uzfs_zvol_worker(void *arg)
 			zio_cmd_free(&zio_cmd);
 		goto drop_refcount;
 	}
-
-	atomic_inc_64(&zinfo->inflight_io_cnt);
 
 	/*
 	 * If zvol hasn't passed rebuild phase or if read
@@ -441,6 +556,151 @@ drop_refcount:
 	atomic_add_64(&zinfo->inflight_io_cnt, -1);
 	atomic_add_64(&zinfo->dispatched_io_cnt, -1);
 
+	uzfs_zinfo_drop_refcnt(zinfo);
+}
+
+/*
+ * zvol worker is responsible for actual work.
+ * It execute read/write/sync command to uzfs.
+ * It enqueue command to completion queue and
+ * send signal to ack-sender thread.
+ *
+ * Write commands that are for rebuild will not
+ * be enqueued. Also, commands memory is
+ * maintained by its caller.
+ */
+void
+uzfs_zvol_io_worker(void *arg)
+{
+	zvol_io_cmd_t	*zio_cmd;
+	zvol_info_t	*zinfo;
+	zvol_state_t	*zvol_state, *read_zv;
+	zvol_io_hdr_t 	*hdr;
+	metadata_desc_t	**metadata_desc;
+	int		rc = 0;
+	boolean_t	rebuild_cmd_req;
+	boolean_t	read_metadata;
+
+	zio_cmd = (zvol_io_cmd_t *)arg;
+	hdr = &zio_cmd->hdr;
+	zinfo = zio_cmd->zinfo;
+	zvol_state = zinfo->main_zv;
+	rebuild_cmd_req = hdr->flags & ZVOL_OP_FLAG_REBUILD;
+	read_metadata = hdr->flags & ZVOL_OP_FLAG_READ_METADATA;
+
+	zvol_conn_t *conn = zio_cmd->mconn;
+
+	LOG_INFO("executing IO opcode %d seq: %lu",
+	    hdr->opcode, zio_cmd->hdr.io_seq);
+	atomic_inc_64(&zinfo->inflight_io_cnt);
+
+	/*
+	 * For rebuild case, do not free zio_cmd
+	 */
+	if (zinfo->state == ZVOL_INFO_STATE_OFFLINE) {
+		hdr->status = ZVOL_OP_STATUS_FAILED;
+		hdr->len = 0;
+		if (!(rebuild_cmd_req && (hdr->opcode == ZVOL_OPCODE_WRITE)))
+			zio_cmd_free(&zio_cmd);
+		goto drop_refcount;
+	}
+
+	/*
+	 * If zvol hasn't passed rebuild phase or if read
+	 * is meant for rebuild or if target has asked for metadata
+	 * then we need the metadata
+	 */
+	if ((!rebuild_cmd_req && ZVOL_IS_REBUILDED(zvol_state)) &&
+	    !read_metadata) {
+		metadata_desc = NULL;
+		zio_cmd->metadata_desc = NULL;
+	} else {
+		metadata_desc = &zio_cmd->metadata_desc;
+	}
+
+	zio_cmd->io_start_time = gethrtime();
+
+	switch (hdr->opcode) {
+		case ZVOL_OPCODE_READ:
+			read_zv = zinfo->main_zv;
+			if (rebuild_cmd_req) {
+				/*
+				 * if we are rebuilding, we have
+				 * to read the data from the snapshot
+				 */
+				if (zinfo->rebuild_zv) {
+					read_zv = zinfo->rebuild_zv;
+				} else {
+					rc = -1;
+					break;
+				}
+			} else if (!ZVOL_IS_HEALTHY(zinfo->main_zv))
+				/* App IOs should go to clone_zv */
+				read_zv = zinfo->clone_zv;
+
+			rc = uzfs_read_data(read_zv,
+			    (char *)zio_cmd->buf,
+			    hdr->offset, hdr->len,
+			    metadata_desc);
+
+			atomic_inc_64(&zinfo->read_req_received_cnt);
+			break;
+
+		case ZVOL_OPCODE_WRITE:
+			rc = uzfs_submit_writes(zinfo, zio_cmd);
+			atomic_inc_64(&zinfo->write_req_received_cnt);
+			break;
+
+		case ZVOL_OPCODE_SYNC:
+			if (ZVOL_IS_HEALTHY(zinfo->main_zv) ||
+			    ZVOL_IS_REBUILDING_AFS(zinfo->main_zv)) {
+				uzfs_flush_data(zinfo->main_zv);
+			}
+			if (!ZVOL_IS_HEALTHY(zinfo->main_zv))
+				uzfs_flush_data(zinfo->clone_zv);
+			atomic_inc_64(&zinfo->sync_req_received_cnt);
+			break;
+
+		case ZVOL_OPCODE_REBUILD_SNAP_DONE:
+		case ZVOL_OPCODE_REBUILD_ALL_SNAP_DONE:
+		case ZVOL_OPCODE_REBUILD_STEP_DONE:
+			break;
+		default:
+			VERIFY(!"Should be a valid opcode");
+			break;
+	}
+
+	if (rc != 0) {
+		LOG_ERR("OP code %d failed: %d", hdr->opcode, rc);
+		hdr->status = ZVOL_OP_STATUS_FAILED;
+		hdr->len = 0;
+	} else {
+		hdr->status = ZVOL_OP_STATUS_OK;
+	}
+
+	/*
+	 * We are not sending ACK for writes meant for rebuild
+	 */
+	if (rebuild_cmd_req && (hdr->opcode == ZVOL_OPCODE_WRITE)) {
+		goto drop_refcount;
+	}
+
+	(void) pthread_mutex_lock(&conn->conn_mutex);
+	STAILQ_INSERT_TAIL(&conn->io_ackq, zio_cmd, cmd_link);
+	(void) pthread_mutex_unlock(&conn->conn_mutex);
+
+	uint64_t data = 1;
+
+	rc = write(conn->evfd, &data, sizeof (data));
+	VERIFY3P(rc, ==, sizeof (data));
+	LOG_INFO("write event on evfd %d opcode %d seq: %lu",
+	    conn->evfd, hdr->opcode, zio_cmd->hdr.io_seq);
+
+drop_refcount:
+	atomic_add_64(&zinfo->inflight_io_cnt, -1);
+	atomic_add_64(&zinfo->dispatched_io_cnt, -1);
+
+	LOG_INFO("exiting io worker");
 	uzfs_zinfo_drop_refcnt(zinfo);
 }
 
@@ -1078,6 +1338,26 @@ remove_pending_cmds_to_ack(int fd, zvol_info_t *zinfo)
 		(void) pthread_mutex_lock(&zinfo->zinfo_mutex);
 	}
 	(void) pthread_mutex_unlock(&zinfo->zinfo_mutex);
+}
+
+void
+free_conn(zvol_conn_t *conn)
+{
+	zvol_io_cmd_t *zio_cmd, *zio_cmd_next;
+	if (conn == NULL)
+		return;
+	(void) pthread_mutex_lock(&conn->conn_mutex);
+	zio_cmd = STAILQ_FIRST(&conn->io_ackq);
+	while (zio_cmd != NULL) {
+		zio_cmd_next = STAILQ_NEXT(zio_cmd, cmd_link);
+		STAILQ_REMOVE(&conn->io_ackq, zio_cmd,
+		    zvol_io_cmd_s, cmd_link);
+		zio_cmd_free(&zio_cmd);
+		zio_cmd = zio_cmd_next;
+	}
+	(void) pthread_mutex_unlock(&conn->conn_mutex);
+	(void) pthread_mutex_destroy(&conn->conn_mutex);
+	free(conn);
 }
 
 /*
@@ -1729,18 +2009,116 @@ end:
 }
 
 /*
+ * This func takes care of sending potentially multiple read blocks each
+ * prefixed by metainfo.
+ */
+static int
+uzfs_mconn_send_reads(int fd, zvol_io_cmd_t *zio_cmd)
+{
+	zvol_io_hdr_t 	*hdr = &zio_cmd->hdr;
+	struct zvol_io_rw_hdr read_hdr;
+	int	rc = 0;
+	static __thread int sent = 0;
+	static __thread metadata_desc_t *md = NULL;
+	static __thread size_t	rel_offset = 0;
+
+	if (md == NULL)
+		md = zio_cmd->metadata_desc;
+
+	LOG_INFO("start send read for op: %d, seq-id: %ld status: %u",
+	    zio_cmd->hdr.opcode, zio_cmd->hdr.io_seq, zio_cmd->hdr.status);
+	/* special case for missing metadata */
+	if (zio_cmd->metadata_desc == NULL) {
+		read_hdr.io_num = 0;
+		/*
+		 * read_hdr.len should be adjusted back
+		 * to actual read request size now
+		 */
+		read_hdr.len = hdr->len -
+		    sizeof (struct zvol_io_rw_hdr);
+		if (sent < sizeof (read_hdr)) {
+			char *data = (char *)&read_hdr + sent;
+			int len = sizeof (read_hdr) - sent;
+			rc = uzfs_zvol_conn_write(fd, data, len);
+			if (rc < 0)
+				return (-1);
+			sent += rc;
+			if (rc != len)
+				return (1);
+		}
+		if (sent >= sizeof (read_hdr)) {
+			char *data = (char *)zio_cmd->buf + (sent - sizeof (read_hdr));
+			int len = read_hdr.len - (sent - sizeof (read_hdr));
+			/* Data that need to be sent is equal to read_hdr.len */
+			rc = uzfs_zvol_conn_write(fd, data, len);
+
+			if (rc < 0)
+				return (-1);
+			sent += rc;
+			if (rc != len)
+				return (1);
+		}
+		LOG_INFO("done missing send read for op: %d, seq-id: %ld status: %u",
+		    zio_cmd->hdr.opcode, zio_cmd->hdr.io_seq, zio_cmd->hdr.status);
+		sent = 0;
+		return (0);
+	}
+
+	/*
+	 * TODO: Optimize performance by combining multiple writes to a single
+	 * system call either by copying all data to larger buffer or using
+	 * vector write.
+	 */
+	for (; md != NULL; md = md->next) {
+		read_hdr.io_num = md->metadata.io_num;
+		read_hdr.len = md->len;
+		if (sent < sizeof (read_hdr)) {
+			char *data = (char *)&read_hdr + sent;
+			int len = sizeof (read_hdr) - sent;
+			rc = uzfs_zvol_conn_write(fd, data, len);
+			if (rc < 0)
+				goto end;
+			sent += rc;
+			if (rc != len)
+				return (1);
+		}
+
+		if (sent >= sizeof (read_hdr)) {
+			char *data = (char *)zio_cmd->buf + rel_offset + (sent - sizeof (read_hdr));
+			int len = md->len - (sent - sizeof (read_hdr));
+			rc = uzfs_zvol_conn_write(fd, data, len);
+			if (rc < 0)
+				goto end;
+			sent += rc;
+			if (rc != len)
+				return (1);
+			rel_offset += md->len;
+		}
+		sent = 0;
+	}
+
+	rc = 0;
+end:
+	sent = 0;
+	md = NULL;
+	rel_offset = 0;
+	FREE_METADATA_LIST(zio_cmd->metadata_desc);
+	zio_cmd->metadata_desc = NULL;
+
+	LOG_INFO("done %s send read for op: %d, seq-id: %ld status: %u",
+	    rc ? "error" : "success",
+	    zio_cmd->hdr.opcode, zio_cmd->hdr.io_seq, zio_cmd->hdr.status);
+	return (rc);
+}
+
+/*
  * One thread per LUN/vol. This thread works
  * on queue and it sends ack back to client on
  * a given fd.
- * There are two types of clients - one is iscsi target, and,
- * other is a replica which undergoes rebuild.
- * Need to exit from thread when there are network errors
- * on fd related to iscsi target.
  */
 static void
 uzfs_zvol_io_ack_sender(void *arg)
 {
-	int fd;
 	int md_len;
 	zvol_info_t		*zinfo;
 	thread_args_t 		*thrd_arg;
@@ -1748,13 +2126,12 @@ uzfs_zvol_io_ack_sender(void *arg)
 	uint64_t len, latency;
 
 	thrd_arg = (thread_args_t *)arg;
-	fd = thrd_arg->fd;
 	zinfo = thrd_arg->zinfo;
 	kmem_free(arg, sizeof (thread_args_t));
 
 	prctl(PR_SET_NAME, "ack_sender", 0, 0, 0);
 
-	LOG_INFO("Started ack sender for zvol %s fd: %d", zinfo->name, fd);
+	LOG_INFO("Started ack sender for zvol %s", zinfo->name);
 
 	while (1) {
 		int rc = 0;
@@ -1816,14 +2193,6 @@ error_check:
 			if (rc == -1) {
 				LOG_ERRNO("socket write err");
 				zinfo->zio_cmd_in_ack = NULL;
-				/*
-				 * exit due to network errors on fd related
-				 * to iscsi target
-				 */
-				if (zio_cmd->conn == fd) {
-					zio_cmd_free(&zio_cmd);
-					goto exit;
-				}
 				zio_cmd_free(&zio_cmd);
 				continue;
 			}
@@ -1837,10 +2206,6 @@ error_check:
 				if (rc == -1) {
 					zinfo->zio_cmd_in_ack = NULL;
 					LOG_ERRNO("socket write err");
-					if (zio_cmd->conn == fd) {
-						zio_cmd_free(&zio_cmd);
-						goto exit;
-					}
 				}
 			}
 			latency = gethrtime() - zio_cmd->io_start_time;
@@ -1890,19 +2255,19 @@ error_check:
 	}
 exit:
 	zinfo->zio_cmd_in_ack = NULL;
-	shutdown(fd, SHUT_RDWR);
 
 	(void) pthread_mutex_lock(&zinfo->zinfo_mutex);
 	zinfo->is_io_ack_sender_created = 0;
 	zinfo->conn_closed = B_FALSE;
 	(void) pthread_mutex_unlock(&zinfo->zinfo_mutex);
 
-	LOG_INFO("Data connection for zvol %s closed on fd: %d",
-	    zinfo->name, fd);
+	LOG_INFO("ack sender terminated for zvol %s closed", zinfo->name);
+
 	uzfs_zinfo_drop_refcnt(zinfo);
 
 	zk_thread_exit();
 }
+
 /*
  * Process open request on data connection, the first message.
  *
@@ -1955,20 +2320,6 @@ open_zvol(int fd, zvol_info_t **zinfopp)
 	(void) pthread_mutex_lock(&zinfo->zinfo_mutex);
 	if (zinfo->state != ZVOL_INFO_STATE_ONLINE) {
 		LOG_ERR("zvol %s is not online", open_data.volname);
-		hdr.status = ZVOL_OP_STATUS_FAILED;
-		(void) pthread_mutex_unlock(&zinfo->zinfo_mutex);
-		goto open_reply;
-	}
-	if (zinfo->is_io_ack_sender_created) {
-		LOG_ERR("zvol %s ack sender already present",
-		    open_data.volname);
-		hdr.status = ZVOL_OP_STATUS_FAILED;
-		(void) pthread_mutex_unlock(&zinfo->zinfo_mutex);
-		goto open_reply;
-	}
-	if (zinfo->is_io_receiver_created) {
-		LOG_ERR("zvol %s io receiver already present",
-		    open_data.volname);
 		hdr.status = ZVOL_OP_STATUS_FAILED;
 		(void) pthread_mutex_unlock(&zinfo->zinfo_mutex);
 		goto open_reply;
@@ -2049,17 +2400,20 @@ error_ret:
 	*zinfopp = zinfo;
 
 	zinfo->conn_closed = B_FALSE;
+	int ack_sender_present = zinfo->is_io_ack_sender_created;
 	zinfo->is_io_ack_sender_created = 1;
-	zinfo->is_io_receiver_created = 1;
+	atomic_add_64(&zinfo->is_io_receiver_created, 1);
 	(void) pthread_mutex_unlock(&zinfo->zinfo_mutex);
-	thrd_arg = kmem_alloc(sizeof (thread_args_t), KM_SLEEP);
-	thrd_arg->fd = fd;
-	thrd_arg->zinfo = zinfo;
-	uzfs_zinfo_take_refcnt(zinfo);
-	thrd_info = zk_thread_create(NULL, 0,
-	    (thread_func_t)uzfs_zvol_io_ack_sender, (void *)thrd_arg, 0, NULL,
-	    TS_RUN, 0, PTHREAD_CREATE_DETACHED);
-	VERIFY3P(thrd_info, !=, NULL);
+	if (ack_sender_present == 0) {
+		thrd_arg = kmem_alloc(sizeof (thread_args_t), KM_SLEEP);
+		thrd_arg->zinfo = zinfo;
+		uzfs_zinfo_take_refcnt(zinfo);
+		thrd_info = zk_thread_create(NULL, 0,
+		    (thread_func_t)uzfs_zvol_io_ack_sender,
+		    (void *)thrd_arg, 0, NULL,
+		    TS_RUN, 0, PTHREAD_CREATE_DETACHED);
+		VERIFY3P(thrd_info, !=, NULL);
+	}
 
 	hdr.status = ZVOL_OP_STATUS_OK;
 
@@ -2083,6 +2437,218 @@ open_reply:
 }
 
 /*
+ * One thread per LUN/vol. This thread works
+ * on queue and it sends ack back to client on
+ * a given fd.
+ * There are two types of clients - one is iscsi target, and,
+ * other is a replica which undergoes rebuild.
+ * Need to exit from thread when there are network errors
+ * on fd related to iscsi target.
+ */
+int
+uzfs_mconn_io_ack_sender(zvol_info_t *zinfo, zvol_conn_t *conn)
+{
+	static __thread int md_len = 0;
+	uint64_t len, latency;
+
+	int rc = 0;
+
+	(void) pthread_mutex_lock(&conn->conn_mutex);
+	zvol_io_cmd_t *zio_cmd = STAILQ_FIRST(&conn->io_ackq);
+	if (zio_cmd == NULL) {
+		(void) pthread_mutex_unlock(&conn->conn_mutex);
+		return (0);
+	}
+	(void) pthread_mutex_unlock(&conn->conn_mutex);
+
+
+	if (zio_cmd->hdr.flags & ZVOL_OP_FLAG_REBUILD)
+		atomic_inc_64(&zinfo->rebuild_cmd_acked_cnt);
+
+	LOG_INFO("ACK for op: %d, seq-id: %ld status: %u",
+	    zio_cmd->hdr.opcode, zio_cmd->hdr.io_seq, zio_cmd->hdr.status);
+
+	/* account for space taken by metadata headers */
+	if (md_len == 0 &&
+	    zio_cmd->hdr.status == ZVOL_OP_STATUS_OK &&
+	    zio_cmd->hdr.opcode == ZVOL_OPCODE_READ) {
+		md_len = 0;
+		for (metadata_desc_t *md = zio_cmd->metadata_desc;
+		    md != NULL;
+		    md = md->next) {
+			md_len++;
+		}
+		/* we need at least one header even if no metadata */
+		if (md_len == 0)
+			md_len++;
+		zio_cmd->hdr.len += (md_len *
+		    sizeof (struct zvol_io_rw_hdr));
+	}
+
+	rc = uzfs_ack_write(zio_cmd);
+
+	if (rc == -1) {
+		LOG_ERRNO("socket write err");
+		goto exit;
+	} else if (rc == 1) {
+		return (0);
+	}
+
+	latency = 0;
+	if (zio_cmd->hdr.opcode == ZVOL_OPCODE_READ) {
+		if (zio_cmd->hdr.status == ZVOL_OP_STATUS_OK) {
+			/* Send data read from disk */
+			rc = uzfs_mconn_send_reads(zio_cmd->conn, zio_cmd);
+			if (rc == -1) {
+				LOG_ERRNO("socket sending read err");
+				goto exit;
+			} else if (rc == 1) {
+				return (0);
+			}
+		}
+		latency = gethrtime() - zio_cmd->io_start_time;
+		atomic_inc_64(&zinfo->read_req_ack_cnt);
+		atomic_add_64(&zinfo->read_byte, zio_cmd->hdr.len);
+		atomic_add_64(&zinfo->read_latency, latency);
+
+		len = zio_cmd->hdr.len;
+		if (len < ZFS_HISTOGRAM_IO_SIZE) {
+			zfs_histogram_add(zinfo->uzfs_rio_histogram,
+			    len, len, latency);
+		} else {
+			zfs_histogram_add(zinfo->uzfs_rio_histogram,
+			    ZFS_HISTOGRAM_IO_SIZE, len, latency);
+		}
+	} else {
+		if (zio_cmd->hdr.opcode == ZVOL_OPCODE_WRITE) {
+			latency = gethrtime() - zio_cmd->io_start_time;
+			atomic_inc_64(&zinfo->write_req_ack_cnt);
+			atomic_add_64(&zinfo->write_byte,
+			    zio_cmd->hdr.len);
+			atomic_add_64(&zinfo->write_latency, latency);
+
+			len = zio_cmd->hdr.len;
+			if (len < ZFS_HISTOGRAM_IO_SIZE) {
+				zfs_histogram_add(zinfo->
+				    uzfs_wio_histogram, len,
+				    len, latency);
+			} else {
+				zfs_histogram_add(zinfo->
+				    uzfs_wio_histogram,
+				    ZFS_HISTOGRAM_IO_SIZE,
+				    len, latency);
+			}
+		} else if (zio_cmd->hdr.opcode == ZVOL_OPCODE_SYNC) {
+			atomic_inc_64(&zinfo->sync_req_ack_cnt);
+			latency = (gethrtime() -
+			    zio_cmd->io_start_time);
+			atomic_add_64(&zinfo->sync_latency, latency);
+		}
+	}
+	if ((latency >> 30) > IO_THRESHOLD_TIME)
+		LOG_INFO("IO %d with seq: %lu took %luns",
+		    zio_cmd->hdr.opcode, zio_cmd->hdr.io_seq, latency);
+
+	rc = 1;
+exit :
+	(void) pthread_mutex_lock(&conn->conn_mutex);
+	STAILQ_REMOVE_HEAD(&conn->io_ackq, cmd_link);
+	(void) pthread_mutex_unlock(&conn->conn_mutex);
+	md_len = 0;
+	zio_cmd_free(&zio_cmd);
+
+	return (rc);
+}
+
+int
+uzfs_handle_zvol_read(zvol_conn_t *conn, zvol_info_t *zinfo)
+{
+	static __thread zvol_io_cmd_t *zio_cmd;
+	static __thread zvol_io_hdr_t hdr;
+	int fd = conn->fd;
+	int *len = &conn->len;
+
+	int rc = uzfs_zvol_read_conn_header(fd, &hdr, len);
+
+	if (rc <= 0) {
+		return (rc);
+	}
+
+	if ((zinfo->state == ZVOL_INFO_STATE_OFFLINE)) {
+		LOG_ERR("zvol state offline");
+		return (-1);
+	}
+
+	if (hdr.opcode != ZVOL_OPCODE_WRITE &&
+	    hdr.opcode != ZVOL_OPCODE_READ &&
+	    hdr.opcode != ZVOL_OPCODE_SYNC) {
+		LOG_ERR("Unexpected opcode %d", hdr.opcode);
+		return (-1);
+	}
+
+	if (((hdr.opcode == ZVOL_OPCODE_WRITE) ||
+	    (hdr.opcode == ZVOL_OPCODE_READ)) && !hdr.len) {
+		LOG_ERR("Zero Payload size for opcode %d", hdr.opcode);
+		return (-1);
+	} else if ((hdr.opcode == ZVOL_OPCODE_SYNC) && hdr.len > 0) {
+		LOG_ERR("Unexpected payload for opcode %d", hdr.opcode);
+		return (-1);
+	}
+
+	LOG_INFO("read the IO header len: %d op: %d seq: %lu",
+	    *len, hdr.opcode, hdr.io_seq);
+
+	if (*len == sizeof (hdr) && zio_cmd == NULL) {
+		LOG_INFO("allocated zio_cmd");
+		zio_cmd = zio_cmd_alloc(&hdr, fd);
+		zio_cmd->mconn = conn;
+	} else {
+		LOG_INFO("zio_cmd already there");
+	}
+	/* Read payload for commands which have it */
+	if (hdr.opcode == ZVOL_OPCODE_WRITE) {
+		uint64_t rlen = *len - sizeof (hdr);
+		uint64_t size = hdr.len - rlen;
+		rc = uzfs_zvol_conn_read(fd, zio_cmd->buf + rlen, size);
+		if (rc < 0) {
+			zio_cmd_free(&zio_cmd);
+			return (-1);
+		}
+		*len += rc;
+		if (rc != size)
+			return (0);
+	}
+
+	if (zinfo->state == ZVOL_INFO_STATE_OFFLINE) {
+		zio_cmd_free(&zio_cmd);
+		return (-1);
+	}
+
+	/* Take refcount for uzfs_zvol_worker to work on it */
+	uzfs_zinfo_take_refcnt(zinfo);
+	zio_cmd->zinfo = zinfo;
+
+	/*
+	 * Rebuild want to take consistent snapshot
+	 * so it asked to flush all outstanding IOs
+	 * before taking snapshot on rebuild_clone
+	 */
+	if (zinfo->quiesce_requested) {
+		taskq_wait_outstanding(zinfo->uzfs_zvol_taskq, 0);
+		zinfo->quiesce_requested = 0;
+		zinfo->quiesce_done = 1;
+	}
+
+	atomic_inc_64(&zinfo->dispatched_io_cnt);
+
+	taskq_dispatch(zinfo->uzfs_zvol_taskq, uzfs_zvol_io_worker,
+	    zio_cmd, TQ_SLEEP);
+	*len = 0;
+	zio_cmd = NULL;
+	return (1);
+}
+
+/*
  * IO-Receiver would be per ZVOL, it would be
  * responsible for receiving IOs on given socket.
  */
@@ -2092,8 +2658,6 @@ uzfs_zvol_io_receiver(void *arg)
 	int		rc;
 	int		fd = (uintptr_t)arg;
 	zvol_info_t	*zinfo = NULL;
-	zvol_io_cmd_t	*zio_cmd;
-	zvol_io_hdr_t	hdr;
 	zvol_state_t	*snap_zv, *clone_zv;
 
 	prctl(PR_SET_NAME, "io_receiver", 0, 0, 0);
@@ -2101,9 +2665,6 @@ uzfs_zvol_io_receiver(void *arg)
 	/* First command should be OPEN */
 	while (zinfo == NULL) {
 		if (open_zvol(fd, &zinfo) != 0) {
-			if ((zinfo != NULL) &&
-			    (zinfo->is_io_ack_sender_created))
-				goto exit;
 			shutdown(fd, SHUT_RDWR);
 			goto thread_exit;
 		}
@@ -2111,100 +2672,113 @@ uzfs_zvol_io_receiver(void *arg)
 
 	zinfo->io_fd = fd;
 
-	LOG_INFO("Data connection associated with zvol %s fd: %d",
-	    zinfo->name, fd);
+	int fflags = fcntl(fd, F_GETFL);
+	if (fflags < 0)
+		goto thread_exit;
 
-	while ((rc = uzfs_zvol_read_header(fd, &hdr)) == 0) {
-		if ((zinfo->state == ZVOL_INFO_STATE_OFFLINE))
-			break;
+	if (fcntl(fd, F_SETFL, fflags | O_NONBLOCK) < 0)
+		goto thread_exit;
 
-		if (hdr.opcode != ZVOL_OPCODE_WRITE &&
-		    hdr.opcode != ZVOL_OPCODE_READ &&
-		    hdr.opcode != ZVOL_OPCODE_SYNC) {
-			LOG_ERR("Unexpected opcode %d", hdr.opcode);
+	int epollfd = epoll_create1(EPOLL_CLOEXEC);
+	if (epollfd < 0) {
+		perror("epoll_create1");
+		goto thread_exit;
+	}
+	struct epoll_event ev;
+	ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+	ev.data.fd = fd;
+	if (epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+		perror("epoll_ctl: listen_sock");
+		close(epollfd);
+		goto thread_exit;
+	}
+
+	int wio_evfd = eventfd(0, EFD_CLOEXEC);
+	if (wio_evfd < 0) {
+		perror("eventfd");
+		close(epollfd);
+		goto thread_exit;
+	}
+	ev.events = EPOLLIN;
+	ev.data.fd = wio_evfd;
+	if (epoll_ctl(epollfd, EPOLL_CTL_ADD, wio_evfd, &ev) == -1) {
+		perror("epoll_ctl");
+		close(epollfd);
+		close(wio_evfd);
+		goto thread_exit;
+	}
+
+	zvol_conn_t *conn = (zvol_conn_t *)malloc(sizeof (zvol_conn_t));
+	if (conn == NULL) {
+		LOG_ERR("not able to allocate conn\n");
+		close(epollfd);
+		close(wio_evfd);
+		goto thread_exit;
+	}
+	conn->fd = fd;
+	conn->len = 0;
+	conn->evfd = wio_evfd;
+	STAILQ_INIT(&conn->io_ackq);
+	(void) pthread_mutex_init(&conn->conn_mutex, NULL);
+
+	LOG_INFO("Data connection associated with zvol %s fd: %d efd %d",
+	    zinfo->name, fd, wio_evfd);
+
+	while (1) {
+		int nfds = epoll_wait(epollfd, &ev, 1, -1);
+
+		LOG_INFO("got events %d on fd: %d", nfds, fd);
+		if (nfds < 0) {
+			perror("epoll_wait returned error");
 			break;
 		}
+		if ((ev.events & EPOLLERR) ||
+		    (ev.events & EPOLLHUP)) {
 
-		if (((hdr.opcode == ZVOL_OPCODE_WRITE) ||
-		    (hdr.opcode == ZVOL_OPCODE_READ)) && !hdr.len) {
-			LOG_ERR("Zero Payload size for opcode %d", hdr.opcode);
-			break;
-		} else if ((hdr.opcode == ZVOL_OPCODE_SYNC) && hdr.len > 0) {
-			LOG_ERR("Unexpected payload for opcode %d", hdr.opcode);
-			break;
+			if (0 > close(ev.data.fd))
+				perror("close err");
+			continue;
 		}
 
-		zio_cmd = zio_cmd_alloc(&hdr, fd);
-		/* Read payload for commands which have it */
-		if (hdr.opcode == ZVOL_OPCODE_WRITE) {
-			rc = uzfs_zvol_socket_read(fd, zio_cmd->buf, hdr.len);
-			if (rc != 0) {
-				zio_cmd_free(&zio_cmd);
+		if (ev.data.fd == wio_evfd) {
+			uint64_t data;
+			if (read(wio_evfd, &data, sizeof (data)) < 0) {
+				perror("eventfd read failed");
 				break;
 			}
+
+			LOG_INFO("got event on evfd %d", ev.data.fd);
+			rc = 1;
+			while (rc == 1) {
+				rc = uzfs_mconn_io_ack_sender(zinfo, conn);
+				if (rc < 0)
+					goto exit;
+			}
+		} else {
+			if (ev.events & EPOLLIN) {
+				LOG_INFO("got read event on fd %d", ev.data.fd);
+				rc = 1;
+				while (rc == 1) {
+					rc = uzfs_handle_zvol_read(conn, zinfo);
+					if (rc < 0)
+						goto exit;
+				}
+				LOG_INFO("done read event fd %d", ev.data.fd);
+			}
+			if (ev.events & EPOLLOUT) {
+				LOG_INFO("got write event fd %d", ev.data.fd);
+				rc = uzfs_mconn_io_ack_sender(zinfo, conn);
+				if (rc < 0)
+					break;
+			}
 		}
-
-		if (zinfo->state == ZVOL_INFO_STATE_OFFLINE) {
-			zio_cmd_free(&zio_cmd);
-			break;
-		}
-
-		/* Take refcount for uzfs_zvol_worker to work on it */
-		uzfs_zinfo_take_refcnt(zinfo);
-		zio_cmd->zinfo = zinfo;
-
-		/*
-		 * Rebuild want to take consistent snapshot
-		 * so it asked to flush all outstanding IOs
-		 * before taking snapshot on rebuild_clone
-		 */
-		if (zinfo->quiesce_requested) {
-			taskq_wait_outstanding(zinfo->uzfs_zvol_taskq, 0);
-			zinfo->quiesce_requested = 0;
-			zinfo->quiesce_done = 1;
-		}
-
-		atomic_inc_64(&zinfo->dispatched_io_cnt);
-
-		taskq_dispatch(zinfo->uzfs_zvol_taskq, uzfs_zvol_worker,
-		    zio_cmd, TQ_SLEEP);
 	}
 exit:
 #if DEBUG
 	if (inject_error.delay.io_receiver_exit == 1)
 		sleep(5);
 #endif
-	(void) pthread_mutex_lock(&zinfo->zinfo_mutex);
-
-	if (zinfo->is_io_ack_sender_created)
-		zinfo->conn_closed = B_TRUE;
-
-	/*
-	 * Send signal to ack sender so that it can free
-	 * zio_cmd, close fd and exit.
-	 */
-	if (zinfo->io_ack_waiting) {
-		rc = pthread_cond_signal(&zinfo->io_ack_cond);
-	}
-	/*
-	 * wait for ack thread to exit to avoid races with new
-	 * connections for the same zinfo
-	 */
-	while (zinfo->conn_closed || zinfo->is_io_ack_sender_created) {
-		(void) pthread_mutex_unlock(&zinfo->zinfo_mutex);
-		LOG_INFO("Waiting for conn_closed(%d) and ack_sender (%d)"
-		    "for fd(%d) to be false for %s", zinfo->conn_closed,
-		    zinfo->is_io_ack_sender_created, fd, zinfo->name);
-		sleep(1);
-		(void) pthread_mutex_lock(&zinfo->zinfo_mutex);
-	}
-	(void) pthread_mutex_unlock(&zinfo->zinfo_mutex);
-
-	remove_pending_cmds_to_ack(fd, zinfo);
-
 	shutdown_fds_related_to_zinfo(zinfo);
-
-	zinfo->io_ack_waiting = 0;
 
 	taskq_wait(zinfo->uzfs_zvol_taskq);
 	reinitialize_zv_state(zinfo->main_zv);
@@ -2221,9 +2795,12 @@ exit:
 
 	zinfo->quiesce_requested = 0;
 	zinfo->quiesce_done = 1;
-	zinfo->is_io_receiver_created = 0;
+	atomic_add_64(&zinfo->is_io_receiver_created, -1);
 	zinfo->io_fd = -1;
 	uzfs_zinfo_drop_refcnt(zinfo);
+	close(epollfd);
+	close(wio_evfd);
+	free_conn(conn);
 thread_exit:
 	close(fd);
 	LOG_INFO("Data connection closed on fd: %d", fd);

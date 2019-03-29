@@ -69,6 +69,7 @@ int uzfs_zvol_socket_read(int fd, char *buf, uint64_t nbytes);
 int uzfs_zvol_read_header(int fd, zvol_io_hdr_t *hdr);
 int uzfs_zvol_socket_write(int fd, char *buf, uint64_t nbytes);
 void uzfs_zvol_worker(void *arg);
+void uzfs_zvol_io_worker(void *arg);
 void uzfs_zvol_rebuild_dw_replica(void *arg);
 void uzfs_zvol_rebuild_scanner(void *arg);
 void uzfs_update_ionum_interval(zvol_info_t *zinfo, uint32_t timeout);
