@@ -180,6 +180,7 @@ typedef struct zvol_info_s {
 	uint8_t		quiesce_requested;
 	uint8_t		quiesce_done;
 	int32_t		io_fd;
+	int 		start_scanner;
 
 	/* Pointer to mgmt connection for this zinfo */
 	void		*mgmt_conn;
@@ -254,6 +255,9 @@ typedef struct zvol_io_cmd_s {
 extern int uzfs_zinfo_init(zvol_state_t *zv, const char *ds_name,
     nvlist_t *create_props);
 extern zvol_info_t *uzfs_zinfo_lookup(const char *name);
+extern zvol_info_t *uzfs_zinfo_rlookup(const char *name);
+extern zvol_info_t *uzfs_zinfo_olookup(const char *name);
+extern zvol_info_t *uzfs_zinfo_tlookup(const char *name, void *conn);
 extern void uzfs_zinfo_replay_zil_all(void);
 extern int uzfs_zinfo_destroy(const char *ds_name, spa_t *spa);
 int uzfs_zvol_get_last_committed_io_no(zvol_state_t *, char *, uint64_t *);

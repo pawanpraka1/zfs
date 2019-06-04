@@ -312,12 +312,12 @@ zinfo_create_cb(zvol_info_t *zinfo, nvlist_t *create_props)
 		if (strcmp(conn->conn_host, target_host) == 0 &&
 		    conn->conn_port == target_port) {
 			/* we already have conn for this target */
-			conn->conn_refcount++;
+	/*		conn->conn_refcount++;
 			zinfo->mgmt_conn = conn;
 			mutex_exit(&conn_list_mtx);
 			kmem_free(new_mgmt_conn, sizeof (*new_mgmt_conn));
 			return;
-		}
+	*/	}
 	}
 
 	new_mgmt_conn->conn_fd = -1;
@@ -620,8 +620,12 @@ uzfs_zvol_stats(uzfs_mgmt_conn_t *conn, zvol_io_hdr_t *hdrp, zvol_info_t *zinfo)
 	objset_t	*zv_objset = zinfo->main_zv->zv_objset;
 
 	strlcpy(stat.label, "used", sizeof (stat.label));
-	stat.value = dsl_dir_phys(
-	    zv_objset->os_dsl_dataset->ds_dir)->dd_uncompressed_bytes;
+	if (zv_objset) {
+		stat.value = dsl_dir_phys(
+		    zv_objset->os_dsl_dataset->ds_dir)->dd_uncompressed_bytes;
+	} else {
+		stat.value = 0;
+	}
 
 	bzero(&hdr, sizeof (hdr));
 	hdr.version = hdrp->version;
@@ -1161,8 +1165,8 @@ ret_error:
 			goto ret_error;
 		}
 
-		LOG_INFO("[%s:%d] at %s:%u helping in rebuild",
-		    mack->volname, io_sfd, mack->ip, mack->port);
+		LOG_INFO("[%s:%d] at %s:%u helping in rebuild the vol %s",
+		    mack->volname, io_sfd, mack->ip, mack->port, zinfo->main_zv->zv_name);
 		uzfs_zinfo_take_refcnt(zinfo);
 
 		thrd_arg = kmem_alloc(sizeof (rebuild_thread_arg_t), KM_SLEEP);
@@ -1209,6 +1213,7 @@ uzfs_zinfo_rebuild_from_clone(zvol_info_t *zinfo)
 	in_hdr.opcode = ZVOL_OPCODE_PREPARE_FOR_REBUILD;
 	in_hdr.io_seq = 0;
 
+	zinfo->start_scanner = 1;
 	rc = uzfs_zvol_mgmt_get_handshake_info(&in_hdr, zinfo->name, zinfo,
 	    &out_hdr, &mack);
 	if (rc != 0)
@@ -1245,7 +1250,7 @@ handle_start_rebuild_req(uzfs_mgmt_conn_t *conn, zvol_io_hdr_t *hdrp,
 
 	/* Find matching zinfo for given downgraded replica */
 	mgmt_ack_t *mack = (mgmt_ack_t *)payload;
-	zinfo = uzfs_zinfo_lookup(mack->dw_volname);
+	zinfo = uzfs_zinfo_tlookup(mack->dw_volname, conn);
 	if ((zinfo == NULL) || (zinfo->mgmt_conn != conn) ||
 	    (zinfo->main_zv == NULL)) {
 		if (zinfo != NULL) {
@@ -1388,7 +1393,7 @@ process_message(uzfs_mgmt_conn_t *conn)
 		strlcpy(zvol_name, payload, payload_size);
 		zvol_name[payload_size] = '\0';
 
-		if ((zinfo = uzfs_zinfo_lookup(zvol_name)) == NULL) {
+		if ((zinfo = uzfs_zinfo_tlookup(zvol_name, conn)) == NULL) {
 			LOGERRCONN(conn, "Unknown zvol: %s", zvol_name);
 			rc = reply_nodata(conn, ZVOL_OP_STATUS_FAILED, hdrp);
 			break;
@@ -1413,9 +1418,10 @@ process_message(uzfs_mgmt_conn_t *conn)
 			    zinfo);
 		} else if (hdrp->opcode == ZVOL_OPCODE_PREPARE_FOR_REBUILD) {
 			LOGCONN(conn, "Prepare for rebuild command for zvol %s",
-			    zvol_name);
+			    zinfo->main_zv->zv_name);
 			rc = uzfs_zvol_mgmt_do_handshake(conn, hdrp, zvol_name,
 			    zinfo);
+			zinfo->start_scanner = 1;
 		} else if (hdrp->opcode == ZVOL_OPCODE_REPLICA_STATUS) {
 			LOGCONN(conn, "Replica status command for zvol %s",
 			    zvol_name);
@@ -1451,7 +1457,7 @@ process_message(uzfs_mgmt_conn_t *conn)
 			*snap++ = '\0';
 		}
 		/* ref will be released when async command has finished */
-		if ((zinfo = uzfs_zinfo_lookup(zvol_name)) == NULL) {
+		if ((zinfo = uzfs_zinfo_tlookup(zvol_name, conn)) == NULL) {
 			LOGERRCONN(conn, "Unknown zvol: %s", zvol_name);
 			rc = reply_nodata(conn, ZVOL_OP_STATUS_FAILED, hdrp);
 			break;
@@ -1506,7 +1512,7 @@ process_message(uzfs_mgmt_conn_t *conn)
 		resize_data = payload;
 
 		/* ref will be released when async command has finished */
-		if ((zinfo = uzfs_zinfo_lookup(resize_data->volname)) == NULL) {
+		if ((zinfo = uzfs_zinfo_tlookup(resize_data->volname, conn)) == NULL) {
 			LOGERRCONN(conn, "Unknown zvol: %s",
 			    resize_data->volname);
 			rc = reply_nodata(conn, ZVOL_OP_STATUS_FAILED, hdrp);

@@ -300,6 +300,77 @@ uzfs_zinfo_lookup(const char *name)
 	return (zv);
 }
 
+zvol_info_t *
+uzfs_zinfo_tlookup(const char *name, void *conn)
+{
+	zvol_info_t *zv = NULL;
+
+	if (name == NULL)
+		return (NULL);
+
+	(void) mutex_enter(&zvol_list_mutex);
+	SLIST_FOREACH(zv, &zvol_list, zinfo_next) {
+		if (uzfs_zvol_name_compare(zv, name) == 0 &&
+		    zv->mgmt_conn == conn)
+			break;
+	}
+	if (zv != NULL) {
+		/* Take refcount */
+		uzfs_zinfo_take_refcnt(zv);
+	}
+	(void) mutex_exit(&zvol_list_mutex);
+
+	return (zv);
+}
+
+zvol_info_t *
+uzfs_zinfo_rlookup(const char *name)
+{
+	zvol_info_t *zv = NULL;
+
+	if (name == NULL)
+		return (NULL);
+
+	(void) mutex_enter(&zvol_list_mutex);
+	SLIST_FOREACH(zv, &zvol_list, zinfo_next) {
+		if (uzfs_zvol_name_compare(zv, name) == 0 &&
+		    zv->start_scanner)
+			break;
+	}
+	if (zv != NULL) {
+		/* Take refcount */
+		uzfs_zinfo_take_refcnt(zv);
+		zv->start_scanner = 0;
+	}
+	(void) mutex_exit(&zvol_list_mutex);
+
+	return (zv);
+}
+
+zvol_info_t *
+uzfs_zinfo_olookup(const char *name)
+{
+	zvol_info_t *zv = NULL;
+
+	if (name == NULL)
+		return (NULL);
+
+	(void) mutex_enter(&zvol_list_mutex);
+	SLIST_FOREACH(zv, &zvol_list, zinfo_next) {
+		if (uzfs_zvol_name_compare(zv, name) == 0 &&
+		    zv->is_io_ack_sender_created == 0)
+			break;
+	}
+	if (zv != NULL) {
+		/* Take refcount */
+		uzfs_zinfo_take_refcnt(zv);
+	}
+	(void) mutex_exit(&zvol_list_mutex);
+
+	return (zv);
+}
+
+
 static void
 uzfs_zinfo_init_mutex(zvol_info_t *zinfo)
 {

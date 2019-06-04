@@ -1574,7 +1574,7 @@ read_socket:
 				goto exit;
 			}
 
-			zinfo = uzfs_zinfo_lookup(name);
+			zinfo = uzfs_zinfo_rlookup(name);
 			if (zinfo == NULL) {
 				LOG_ERR("zvol %s not found for fd(%d)", name,
 				    fd);
@@ -1583,8 +1583,8 @@ read_socket:
 				goto exit;
 			}
 
-			LOG_INFO("Rebuild scanner started on zvol %s from "
-			    "sock(%d)", name, fd);
+			LOG_INFO("Rebuild scanner started on zvol %s %s from "
+			    "sock(%d)", zinfo->main_zv->zv_name, name, fd);
 
 			uzfs_zvol_append_to_fd_list(zinfo, fd);
 
@@ -2164,7 +2164,7 @@ open_zvol(int fd, zvol_info_t **zinfopp)
 
 	fill_default_values_for_version_change(&hdr, &open_data);
 	open_data.volname[MAX_NAME_LEN - 1] = '\0';
-	zinfo = uzfs_zinfo_lookup(open_data.volname);
+	zinfo = uzfs_zinfo_olookup(open_data.volname);
 	if (zinfo == NULL) {
 		LOG_ERR("zvol %s not found", open_data.volname);
 		hdr.status = ZVOL_OP_STATUS_FAILED;
