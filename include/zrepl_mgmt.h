@@ -120,6 +120,8 @@ typedef struct zvol_info_s {
 		struct {
 			int	is_io_ack_sender_created	: 1;
 			int	is_io_receiver_created		: 1;
+			int	is_snap_inprogress		: 1;
+			int	is_afs_inprogress		: 1;
 		};
 		int flags;
 	};
@@ -171,6 +173,8 @@ typedef struct zvol_info_s {
 	/* rebuild scanner info related to this zinfo */
 	STAILQ_HEAD(, zvol_rebuild_scanner_info_s) rebuild_scanner_list;
 
+	/* various tracking status */
+	uint64_t	status;
 	uint8_t		io_ack_waiting;
 
 	/* Will be used to singal ack-sender to exit */
